@@ -96,6 +96,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_manifest_published
 -- 失败作业不占该约束位，允许更正后或针对同一输入重新发起重试。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_job_active
     ON partition_jobs(version_id) WHERE status IN ('queued', 'running', 'succeeded');
+
+-- 评估记录：绑定发起时的输入版本与已发布清单。
+-- current_key 在“当前”记录上等于固定字符串、历史记录为 NULL，
+-- 配合部分唯一索引保证同清单至多一条当前记录；清为 NULL 与写入新当前
+-- 必须在同一事务内完成，避免出现两条“当前”。
+-- 校验失败/过期依据的请求不写任何记录（失败不留半份）。
+CREATE TABLE IF NOT EXISTS evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES input_versions(id),
+    manifest_id INTEGER NOT NULL REFERENCES manifests(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    current_key TEXT,                              -- 'current' | NULL
+    image_csv TEXT NOT NULL,                       -- 上传原文留档
+    class_names TEXT NOT NULL,
+    n_images INTEGER NOT NULL,
+    n_patients INTEGER NOT NULL,
+    bootstrap_iters INTEGER NOT NULL,
+    seed INTEGER NOT NULL,
+    macro_f1 REAL NOT NULL,
+    ci_lower REAL NOT NULL,
+    ci_upper REAL NOT NULL,
+    details TEXT NOT NULL                          -- JSON: 逐类统计与患者级重采样明细
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_current
+    ON evaluations(manifest_id) WHERE current_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS ix_eval_manifest ON evaluations(manifest_id);
+
+CREATE TABLE IF NOT EXISTS evaluation_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id INTEGER NOT NULL REFERENCES evaluations(id),
+    image_no TEXT NOT NULL,
+    patient_no TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    predicted TEXT NOT NULL,
+    probs TEXT NOT NULL,                           -- JSON: {类别: 概率}
+    UNIQUE(evaluation_id, image_no)
+);
 """
 
 

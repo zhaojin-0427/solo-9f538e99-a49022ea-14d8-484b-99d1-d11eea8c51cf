@@ -9,14 +9,27 @@ from datetime import datetime
 
 from . import db as dbmod
 from .db import get_db
+from .evaluation import (
+    BOOTSTRAP_ITERS,
+    BOOTSTRAP_SEED,
+    EvalRow,
+    EvaluationResult,
+    evaluate,
+    predict_label,
+)
 from .parser import (
     InputError,
     parse_dups_csv,
     parse_images_csv,
+    parse_predictions_csv,
     parse_quota,
     validate_and_build,
 )
 from .solver import SolveError, solve
+
+
+class StaleEvaluationError(InputError):
+    """评估依据（输入版本/清单）在校验期间被更正，整份拒绝且不写库。"""
 
 
 class Service:
@@ -80,6 +93,11 @@ class Service:
             # 新版本生效的同一事务里，旧版本全部转为历史
             conn.execute(
                 "UPDATE input_versions SET status='superseded' WHERE id<>?", (vid,)
+            )
+            # 旧版本的评估结果同步降为纯历史，绝不再占据“当前”标记。
+            conn.execute(
+                "UPDATE evaluations SET current_key=NULL WHERE version_id<>?",
+                (vid,),
             )
             conn.execute("COMMIT")
         except Exception:
@@ -445,6 +463,249 @@ class Service:
             return list(
                 conn.execute(
                     "SELECT * FROM side_registry ORDER BY image_no"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ 评估
+    def current_validation(self) -> dict | None:
+        """当前可用于评估的验证集：当前版本 + 其已发布清单的验证侧。
+
+        只认“当前版本”的清单；更正后旧清单即使仍可查询也不能作为当前评估依据。
+        返回 None 表示当前没有可评估的验证清单。
+        """
+        conn = get_db(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT v.id AS version_id, v.class_names, m.id AS manifest_id "
+                "FROM input_versions v "
+                "JOIN manifests m ON m.version_id=v.id AND m.status='published' "
+                "WHERE v.status='active' "
+                "ORDER BY v.id DESC, m.id DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            # 类别集合以该版本 images 表为准（按名称排序，与划分时一致），
+            # 避免类别名本身含逗号时 class_names 拆分失真。
+            classes = [
+                r["class_name"]
+                for r in conn.execute(
+                    "SELECT DISTINCT class_name FROM images WHERE version_id=? "
+                    "ORDER BY class_name",
+                    (row["version_id"],),
+                ).fetchall()
+            ]
+            if not classes and row["class_names"]:
+                classes = row["class_names"].split(",")
+            entries = conn.execute(
+                "SELECT image_no, patient_no, class_name FROM manifest_entries "
+                "WHERE manifest_id=? AND side='val' ORDER BY image_no",
+                (row["manifest_id"],),
+            ).fetchall()
+            return {
+                "version_id": row["version_id"],
+                "manifest_id": row["manifest_id"],
+                "classes": classes,
+                "val_images": {
+                    e["image_no"]: {
+                        "patient_no": e["patient_no"],
+                        "class_name": e["class_name"],
+                    }
+                    for e in entries
+                },
+            }
+        finally:
+            conn.close()
+
+    def submit_evaluation(self, prediction_csv: str) -> int:
+        """校验预测 CSV 并原子写入一条当前评估记录；任何失败不写库。
+
+        与上传/更正交错时：整个“复查当前版本与清单仍是最新 → 写入
+        current 记录”在同一个 BEGIN IMMEDIATE 事务里完成。若校验依据
+        在事务外解析期间已被更正，事务内复查会判 stale 并拒绝写入，
+        绝不会留下标为当前、却基于旧版本的评估结果。
+        """
+        context = self.current_validation()
+        if context is None:
+            raise InputError(
+                "当前没有可评估的验证清单：请先完成划分并发布当前版本的清单"
+            )
+        version_id = context["version_id"]
+        manifest_id = context["manifest_id"]
+        classes = context["classes"]
+        val_images = context["val_images"]
+        if not val_images:
+            raise InputError("当前验证清单为空（没有验证侧图像），无法评估分类效果")
+
+        parsed = parse_predictions_csv(
+            prediction_csv, classes, set(val_images)
+        )
+        rows = [
+            EvalRow(
+                image_no=p.image_no,
+                patient_no=val_images[p.image_no]["patient_no"],
+                truth=val_images[p.image_no]["class_name"],
+                probs=p.probs,
+            )
+            for p in parsed
+        ]
+        result = evaluate(rows, classes, BOOTSTRAP_ITERS, BOOTSTRAP_SEED)
+        details = {
+            "predictions": [
+                {
+                    "image_no": p.image_no,
+                    "patient_no": val_images[p.image_no]["patient_no"],
+                    "truth": val_images[p.image_no]["class_name"],
+                    "predicted": predict_label(p.probs, classes),
+                    "probs": p.probs,
+                }
+                for p in parsed
+            ],
+            "patient_f1": [
+                {
+                    "patient_no": pc.patient_no,
+                    "image_count": pc.image_count,
+                    "tp": dict(zip(classes, pc.tp)),
+                    "fp": dict(zip(classes, pc.fp)),
+                    "fn": dict(zip(classes, pc.fn)),
+                }
+                for pc in result.patient_f1
+            ],
+        }
+        class_payload = [
+            {
+                "class_name": m.class_name,
+                "tp": m.tp,
+                "fp": m.fp,
+                "fn": m.fn,
+                "f1": m.f1,
+            }
+            for m in result.class_metrics
+        ]
+
+        conn = get_db(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            fresh = conn.execute(
+                "SELECT v.id, v.status, m.id AS manifest_id, m.status AS m_status "
+                "FROM input_versions v "
+                "JOIN manifests m ON m.version_id=v.id AND m.status='published' "
+                "WHERE v.status='active' ORDER BY v.id DESC, m.id DESC LIMIT 1"
+            ).fetchone()
+            if (
+                fresh is None
+                or fresh["id"] != version_id
+                or fresh["manifest_id"] != manifest_id
+            ):
+                conn.execute("ROLLBACK")
+                raise StaleEvaluationError(
+                    "评估期间验证清单或输入版本已被更正，该次评估依据已过期，"
+                    "未保存任何记录。请基于当前版本重新上传预测。"
+                )
+            conn.execute(
+                "UPDATE evaluations SET current_key=NULL "
+                "WHERE manifest_id=? AND current_key IS NOT NULL",
+                (manifest_id,),
+            )
+            cur = conn.execute(
+                "INSERT INTO evaluations(version_id, manifest_id, current_key, "
+                "image_csv, class_names, n_images, n_patients, bootstrap_iters, "
+                "seed, macro_f1, ci_lower, ci_upper, details) "
+                "VALUES (?,?,'current',?,?,?,?,?,?,?,?,?,?)",
+                (
+                    version_id,
+                    manifest_id,
+                    prediction_csv,
+                    ",".join(classes),
+                    result.n_images,
+                    result.n_patients,
+                    result.bootstrap_iters,
+                    result.seed,
+                    result.macro_f1,
+                    result.ci_lower,
+                    result.ci_upper,
+                    json.dumps(
+                        {"classes": class_payload, **details}, ensure_ascii=False
+                    ),
+                ),
+            )
+            eval_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO evaluation_predictions(evaluation_id, image_no, "
+                "patient_no, class_name, predicted, probs) VALUES (?,?,?,?,?,?)",
+                [
+                    (
+                        eval_id,
+                        p.image_no,
+                        val_images[p.image_no]["patient_no"],
+                        val_images[p.image_no]["class_name"],
+                        predict_label(p.probs, classes),
+                        json.dumps(p.probs, ensure_ascii=False),
+                    )
+                    for p in parsed
+                ],
+            )
+            conn.execute("COMMIT")
+        except StaleEvaluationError:
+            raise
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+        return eval_id
+
+    def get_evaluation(self, eval_id: int) -> sqlite3.Row | None:
+        conn = get_db(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT e.*, v.status AS version_status, v.image_count AS version_image_count "
+                "FROM evaluations e JOIN input_versions v ON v.id=e.version_id "
+                "WHERE e.id=?",
+                (eval_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def current_evaluation(self) -> sqlite3.Row | None:
+        """当前版本、当前清单对应的“当前”评估；历史版本的评估永不算当前。"""
+        conn = get_db(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT e.*, v.status AS version_status FROM evaluations e "
+                "JOIN input_versions v ON v.id=e.version_id "
+                "WHERE e.current_key IS NOT NULL AND v.status='active' "
+                "ORDER BY e.id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def list_evaluations(self, limit: int = 100) -> list[sqlite3.Row]:
+        conn = get_db(self.db_path)
+        try:
+            return list(
+                conn.execute(
+                    "SELECT e.*, v.status AS version_status FROM evaluations e "
+                    "JOIN input_versions v ON v.id=e.version_id "
+                    "ORDER BY e.id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+    def evaluation_predictions(self, eval_id: int) -> list[sqlite3.Row]:
+        conn = get_db(self.db_path)
+        try:
+            return list(
+                conn.execute(
+                    "SELECT * FROM evaluation_predictions WHERE evaluation_id=? "
+                    "ORDER BY image_no",
+                    (eval_id,),
                 ).fetchall()
             )
         finally:

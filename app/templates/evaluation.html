@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}评估 #{{ evaluation.id }}{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>评估 #{{ evaluation.id }}
+    {% if is_current %}<span class="tag ok">当前</span>{% else %}<span class="tag hist">历史</span>{% endif %}
+  </h2>
+  <p class="muted">绑定输入版本 v{{ evaluation.version_id }}（{{ '当前' if evaluation.version_status=='active' else '已更正为历史' }}）
+    ｜ 清单 #{{ evaluation.manifest_id }} ｜ {{ evaluation.created_at }}<br>
+    验证图像 {{ evaluation.n_images }} 张 ｜ 患者 {{ evaluation.n_patients }} 位 ｜
+    bootstrap {{ evaluation.bootstrap_iters }} 次 ｜ seed={{ evaluation.seed }}（固定种子，结果可复现）</p>
+
+  {% if not is_current %}
+  <p class="reason">该评估所依据的输入版本或清单已被更正，仅作历史查看，不再代表当前结果。</p>
+  {% endif %}
+
+  <h2>各类 F1（真值取自验证清单类别）</h2>
+  <table>
+    <tr><th>类别</th><th>TP</th><th>FP</th><th>FN</th><th>F1</th></tr>
+    {% for c in details.classes %}
+    <tr><td>{{ c.class_name }}</td><td>{{ c.tp }}</td><td>{{ c.fp }}</td><td>{{ c.fn }}</td><td>{{ c.f1|f4 }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h2 style="margin-top:18px">宏平均 F1 与患者整组 bootstrap 95% 区间</h2>
+  <p>宏平均 F1：<strong>{{ evaluation.macro_f1|f4 }}</strong>
+     ｜ 95% 区间：[{{ evaluation.ci_lower|f4 }}, {{ evaluation.ci_upper|f4 }}]</p>
+  <p class="muted">每次重采样以患者为单位整组抽取（同患者多图一起进出），共 {{ evaluation.bootstrap_iters }} 次；
+    每次均使用完整类别集合 {{ evaluation.class_names }}，分母为 0 的类别记 0。</p>
+
+  <h2 style="margin-top:18px">逐图预测与患者计数</h2>
+  <table>
+    <tr><th>图像号</th><th>患者号</th><th>真值</th><th>预测</th>
+      {% for c in details.classes %}<th>P({{ c.class_name }})</th>{% endfor %}
+    </tr>
+    {% for p in predictions %}
+    <tr>
+      <td>{{ p.image_no }}</td><td>{{ p.patient_no }}</td><td>{{ p.class_name }}</td>
+      <td>{{ p.predicted }}{% if p.predicted != p.class_name %} <span class="tag fail">误</span>{% endif %}</td>
+      {% for c in details.classes %}<td>{{ (p.probs_json.get(c.class_name))|f4 }}</td>{% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+
+  <details style="margin-top:14px">
+    <summary class="muted">患者级计数（重采样单元）</summary>
+    <table style="margin-top:8px">
+      <tr><th>患者号</th><th>验证图数</th><th>各类 TP/FP/FN</th></tr>
+      {% for pc in details.patient_f1 %}
+      <tr>
+        <td>{{ pc.patient_no }}</td><td>{{ pc.image_count }}</td>
+        <td class="muted">
+          {% for c in details.classes %}
+            {{ c.class_name }}: TP {{ pc.tp[c.class_name] }} / FP {{ pc.fp[c.class_name] }} / FN {{ pc.fn[c.class_name] }}{% if not loop.last %}；{% endif %}
+          {% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </details>
+
+  <details style="margin-top:14px">
+    <summary class="muted">上传的预测 CSV 原文（留档）</summary>
+    <pre>{{ evaluation.image_csv }}</pre>
+  </details>
+
+  <p style="margin-top:16px">
+    <a class="btn secondary small" href="{{ url_for('index') }}">返回当前版本</a>
+    <a class="btn secondary small" href="{{ url_for('evaluations') }}">全部评估</a>
+  </p>
+</div>
+{% endblock %}

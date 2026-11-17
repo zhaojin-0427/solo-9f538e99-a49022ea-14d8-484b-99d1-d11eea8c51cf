@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from dataclasses import dataclass, field
 
 from .db import MAX_CLASSES, MAX_IMAGES
@@ -213,3 +214,125 @@ def parse_quota(raw: dict[str, int], classes: list[str]) -> dict[str, int]:
             raise InputError(f"类别「{cls}」的验证张数不能为负数")
         quota[cls] = n
     return quota
+
+
+# ------------------------------------------------------------------ 预测 CSV
+PROB_HEADERS = [
+    ("图像号",),
+    ("image_no",),
+    ("image",),
+    ("image_id",),
+    ("图像",),
+]
+PROB_SUM_TOLERANCE = 1e-6
+
+
+@dataclass
+class PredictionRow:
+    image_no: str
+    probs: dict[str, float]
+
+
+def parse_predictions_csv(
+    text: str,
+    classes: list[str],
+    val_images: set[str],
+) -> list[PredictionRow]:
+    """解析逐图概率 CSV，整份校验，任何一行不合格即整体拒绝。
+
+    格式：首行表头必须含图像号列与当前输入版本的每一个类别列（列名完全一致），
+    不接受多余列。每行概率必须为有限实数且落在 [0,1]，同一行概率和与 1 的
+    偏差不得超过 1e-6。数据行必须与验证清单图像恰好一一对应：
+    不得重复、不得缺少、不得包含训练侧或清单外图像。
+    """
+    if not classes:
+        raise InputError("当前输入版本没有类别，无法评估")
+    if not val_images:
+        raise InputError("当前验证清单为空（没有验证侧图像），无法评估分类效果")
+
+    rows = _read_rows(text)
+    header = rows[0]
+    if len({h.lower() for h in header}) != len(header):
+        raise InputError("预测 CSV 表头存在重复列名")
+
+    image_col = None
+    for cand in PROB_HEADERS:
+        hits = [i for i, h in enumerate(header) if h.lower() == cand[0].lower()]
+        if hits:
+            image_col = hits[0]
+            break
+    if image_col is None:
+        raise InputError("预测 CSV 缺少图像号列（可用表头：图像号 / image_no）")
+
+    class_cols: dict[str, int] = {}
+    for cls in classes:
+        hits = [i for i, h in enumerate(header) if h == cls]
+        if not hits:
+            raise InputError(
+                f"预测 CSV 缺少类别列「{cls}」；类别列必须与当前输入版本完全一致："
+                f"{'、'.join(classes)}"
+            )
+        class_cols[cls] = hits[0]
+
+    expected = {image_col, *class_cols.values()}
+    extras = [h for i, h in enumerate(header) if i not in expected]
+    if extras:
+        raise InputError(
+            f"预测 CSV 存在不属于当前类别的多余列：{'、'.join(extras)}；"
+            f"类别列必须与当前输入版本完全一致：{'、'.join(classes)}"
+        )
+
+    out: list[PredictionRow] = []
+    seen: set[str] = set()
+    for n, row in enumerate(rows[1:], start=2):
+        if len(row) != len(header):
+            raise InputError(
+                f"预测 CSV 第 {n} 行有 {len(row)} 列，与表头 {len(header)} 列不一致"
+            )
+        image_no = row[image_col]
+        if not image_no:
+            raise InputError(f"预测 CSV 第 {n} 行图像号为空")
+        if image_no in seen:
+            raise InputError(f"预测 CSV 图像号重复：{image_no}")
+        if image_no not in val_images:
+            # 训练侧图像与清单外图像都会走到这里，分别给清晰说明
+            raise InputError(
+                f"预测 CSV 第 {n} 行的图像 {image_no} 不在当前验证清单中"
+                "（训练侧图像或已过期/清单外图像不得提交）"
+            )
+        seen.add(image_no)
+        probs: dict[str, float] = {}
+        for cls, idx in class_cols.items():
+            raw = row[idx]
+            try:
+                p = float(raw)
+            except (TypeError, ValueError):
+                raise InputError(
+                    f"预测 CSV 第 {n} 行类别「{cls}」的概率不是数字：{raw!r}"
+                )
+            if not math.isfinite(p):
+                raise InputError(
+                    f"预测 CSV 第 {n} 行类别「{cls}」的概率不是有限值：{raw!r}"
+                )
+            if p < 0.0 or p > 1.0:
+                raise InputError(
+                    f"预测 CSV 第 {n} 行类别「{cls}」的概率 {p} 超出 [0,1] 范围"
+                )
+            probs[cls] = p
+        total = sum(probs.values())
+        if abs(total - 1.0) > PROB_SUM_TOLERANCE:
+            raise InputError(
+                f"预测 CSV 第 {n} 行概率和为 {total:.12g}，偏离 1 超过 "
+                f"{PROB_SUM_TOLERANCE:g}"
+            )
+        out.append(PredictionRow(image_no=image_no, probs=probs))
+
+    if not out:
+        raise InputError("预测 CSV 没有数据行")
+    missing = sorted(val_images - seen)
+    if missing:
+        preview = "、".join(missing[:5]) + ("…" if len(missing) > 5 else "")
+        raise InputError(
+            f"预测 CSV 未覆盖全部验证图像，缺少 {len(missing)} 张：{preview}"
+        )
+    return out

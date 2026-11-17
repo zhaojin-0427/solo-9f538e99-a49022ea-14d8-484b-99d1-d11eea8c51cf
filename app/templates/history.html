@@ -62,4 +62,29 @@
     {% endfor %}
   </table>
 </div>
+
+<div class="card">
+  <h2>模型评估历史</h2>
+  <p class="muted">评估绑定上传时的输入版本与清单；更正后旧评估仅作历史查看，不标为当前。</p>
+  <table>
+    <tr><th>评估</th><th>版本</th><th>清单</th><th>状态</th><th>宏平均 F1</th>
+      <th>95% 区间</th><th>图像/患者</th><th>时间</th><th></th></tr>
+    {% for e in evaluations %}
+    <tr>
+      <td>#{{ e.id }}</td>
+      <td>v{{ e.version_id }}{% if e.version_status!='active' %} <span class="tag hist">已更正</span>{% endif %}</td>
+      <td>#{{ e.manifest_id }}</td>
+      <td>{% if e.current_key and e.version_status=='active' %}<span class="tag ok">当前</span>
+          {% else %}<span class="tag hist">历史</span>{% endif %}</td>
+      <td>{{ e.macro_f1|f4 }}</td>
+      <td>[{{ e.ci_lower|f4 }}, {{ e.ci_upper|f4 }}]</td>
+      <td>{{ e.n_images }} / {{ e.n_patients }}</td>
+      <td class="muted">{{ e.created_at }}</td>
+      <td><a class="btn small secondary" href="{{ url_for('evaluation_detail', eval_id=e.id) }}">查看</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted">暂无评估记录</td></tr>
+    {% endfor %}
+  </table>
+</div>
 {% endblock %}

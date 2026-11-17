@@ -80,6 +80,39 @@
   <p class="reason">当前版本尚无发布成功的清单（或上次划分失败/输入刚被更正），两侧下载均停供；重新划分成功后自动恢复。</p>
 </div>
 {% endif %}
+
+<div class="card">
+  <h2>⑤ 模型评估（验证清单逐图预测概率）</h2>
+  <p class="muted">CSV 每行：图像号 + 各类别概率；列必须恰好覆盖验证图像，类别列与当前输入版本
+  （{{ version.class_names if version else '—' }}）完全一致。重复、训练图、缺图、非有限值、概率和偏离 1 超过
+  1e-6 都会导致整份拒绝。真值取自验证清单类别；区间以患者为单位整组重采样 1000 次。</p>
+  {% if version and manifest and val_counts %}
+  <form method="post" action="{{ url_for('evaluation_upload') }}" enctype="multipart/form-data">
+    <p class="muted">表头示例：<code>图像号,{{ classes|join(',') }}</code></p>
+    <input type="file" name="prediction_csv" accept=".csv,text/csv" required>
+    <button class="btn" type="submit">上传并评估</button>
+  </form>
+  {% else %}
+  <p class="reason">当前已发布清单中没有验证侧图像，暂不能评估；请先发布含验证侧的清单。</p>
+  {% endif %}
+
+  {% if current_eval %}
+  <h2 style="margin-top:18px">当前评估 #{{ current_eval.id }}（清单 #{{ current_eval.manifest_id }}，版本 v{{ current_eval.version_id }}）</h2>
+  <p class="muted">{{ current_eval.created_at }} ｜ 验证图像 {{ current_eval.n_images }} 张 ｜ 患者 {{ current_eval.n_patients }} 位 ｜
+    bootstrap {{ current_eval.bootstrap_iters }} 次（seed={{ current_eval.seed }}）</p>
+  <table>
+    <tr><th>类别</th><th>TP</th><th>FP</th><th>FN</th><th>F1</th></tr>
+    {% for c in eval_details.classes %}
+    <tr><td>{{ c.class_name }}</td><td>{{ c.tp }}</td><td>{{ c.fp }}</td><td>{{ c.fn }}</td><td>{{ c.f1|f4 }}</td></tr>
+    {% endfor %}
+    <tr><th>宏平均 F1</th><th colspan="3">95% 区间（患者整组重采样）</th><th>{{ current_eval.macro_f1|f4 }}</th></tr>
+    <tr><td></td><td colspan="3">[{{ current_eval.ci_lower|f4 }}, {{ current_eval.ci_upper|f4 }}]</td><td></td></tr>
+  </table>
+  <p style="margin-top:12px"><a class="btn small" href="{{ url_for('evaluation_detail', eval_id=current_eval.id) }}">查看评估详情</a></p>
+  {% elif manifest %}
+  <p class="muted">当前清单尚无评估记录。</p>
+  {% endif %}
+</div>
 {% endif %}
 
 <div class="card">

@@ -21,7 +21,9 @@ def svc(tmp_db):
 
 
 @pytest.fixture()
-def client(tmp_db):
+def client(tmp_db, monkeypatch):
+    # 划分作业同步执行，测试不依赖外部环境变量
+    monkeypatch.setenv("PYX_SYNCHRONOUS", "1")
     app = create_app(tmp_db)
     app.config["TESTING"] = True
     with app.test_client() as c:

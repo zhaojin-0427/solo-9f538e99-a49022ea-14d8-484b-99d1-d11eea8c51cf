@@ -19,7 +19,7 @@ from flask import (
 
 from .db import VALID, get_db
 from .parser import InputError
-from .service import Service
+from .service import Service, StaleEvaluationError
 
 
 def create_app(db_path: str | None = None) -> Flask:
@@ -31,6 +31,10 @@ def create_app(db_path: str | None = None) -> Flask:
     svc = Service(db_path, synchronous=synchronous, solve_delay=solve_delay)
     app.extensions["service"] = svc
 
+    @app.template_filter("f4")
+    def _f4(value):
+        return "—" if value is None else f"{value:.4f}"
+
     # ------------------------------------------------------------ 首页/仪表盘
     @app.route("/")
     def index():
@@ -40,6 +44,10 @@ def create_app(db_path: str | None = None) -> Flask:
         jobs = svc.list_jobs(limit=8)
         classes = version["class_names"].split(",") if version else []
         quotas = json.loads(version["quotas"]) if version else {}
+        current_eval = svc.current_evaluation()
+        eval_details = (
+            json.loads(current_eval["details"]) if current_eval else None
+        )
         val_counts: dict[str, int] = {}
         train_counts: dict[str, int] = {}
         for e in entries:
@@ -55,6 +63,8 @@ def create_app(db_path: str | None = None) -> Flask:
             quotas=quotas,
             val_counts=val_counts,
             train_counts=train_counts,
+            current_eval=current_eval,
+            eval_details=eval_details,
         )
 
     # ------------------------------------------------------------ 上传/更正
@@ -133,14 +143,68 @@ def create_app(db_path: str | None = None) -> Flask:
             "done": job["status"] in ("succeeded", "failed"),
         }
 
+    # ------------------------------------------------------------ 评估
+    @app.route("/evaluations/upload", methods=["POST"])
+    def evaluation_upload():
+        pred_file = request.files.get("prediction_csv")
+        if not pred_file or not pred_file.filename:
+            flash("请选择逐图预测概率 CSV 文件", "error")
+            return redirect(url_for("index"))
+        csv_text = _decode(pred_file.read())
+        try:
+            eval_id = svc.submit_evaluation(csv_text)
+        except StaleEvaluationError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("index"))
+        except InputError as exc:
+            flash(f"预测 CSV 校验失败，整份拒绝、未保存任何记录：{exc}", "error")
+            return redirect(url_for("index"))
+        flash(f"评估 #{eval_id} 已完成并保存为当前结果。", "success")
+        return redirect(url_for("evaluation_detail", eval_id=eval_id))
+
+    @app.route("/evaluations")
+    def evaluations():
+        rows = svc.list_evaluations()
+        current = svc.current_evaluation()
+        return render_template(
+            "evaluations.html", evaluations=rows, current=current
+        )
+
+    @app.route("/evaluations/<int:eval_id>")
+    def evaluation_detail(eval_id: int):
+        evaluation = svc.get_evaluation(eval_id)
+        if evaluation is None:
+            abort(404)
+        details = json.loads(evaluation["details"])
+        predictions = [
+            {**dict(row), "probs_json": json.loads(row["probs"])}
+            for row in svc.evaluation_predictions(eval_id)
+        ]
+        # 仅当该记录是当前版本当前清单的“当前”结果时才标为当前；
+        # 更正后旧结果一律历史查看。
+        current = svc.current_evaluation()
+        is_current = current is not None and current["id"] == eval_id
+        return render_template(
+            "evaluation.html",
+            evaluation=evaluation,
+            details=details,
+            predictions=predictions,
+            is_current=is_current,
+        )
+
     # ------------------------------------------------------------ 历史
     @app.route("/history")
     def history():
         versions = svc.list_versions()
         jobs = svc.list_jobs(limit=100)
         manifests = svc.list_manifests()
+        evaluations = svc.list_evaluations(limit=100)
         return render_template(
-            "history.html", versions=versions, jobs=jobs, manifests=manifests
+            "history.html",
+            versions=versions,
+            jobs=jobs,
+            manifests=manifests,
+            evaluations=evaluations,
         )
 
     @app.route("/versions/<int:version_id>")
